@@ -1,0 +1,341 @@
+# ---- 0.  Libraries ----
+# install.packages(c("rvest", "dplyr", "readr", "stringr"), repos="https://cloud.r-project.org")
+# install.packages("brms", repos = "https://cloud.r-project.org")
+# install.packages("patchwork")
+library(rvest)     # HTML scraping
+library(dplyr)
+library(readr)
+library(stringr)
+library(brms)
+library(tibble)  # as_tibble()
+library(readr)      # for write_csv()
+library(bayesplot) 
+library(ggplot2)
+library(patchwork)
+# ---- 1.  Scrape season-totals table (identical source) ----
+url  <- "https://www.basketball-reference.com/leagues/NBA_2024_totals.html"
+page <- read_html(url)
+
+totals  <- page %>% html_element("table#totals_stats") %>% html_table()
+
+# ---- 2.  First-pass clean ----
+totals <- totals %>%                                    # remove footer / averages
+  filter(!str_detect(Player, "League Average|Totals")) %>%
+  filter(!is.na(Player))
+
+# convert numeric cols
+non_num <- c("Player", "Pos", "Team", "Awards")   # add Awards here
+totals  <- totals %>%
+  mutate(across(!all_of(non_num), ~ parse_number(as.character(.x))))
+
+
+# ---- 3.  Keep one row per player (choose 'TOT' if it exists) ----
+multi_plyr <- totals %>% group_by(Player) %>% filter(n() > 1) %>% pull(Player) %>% unique()
+totals     <- totals %>% 
+  filter((Team == "TOT") | !(Player %in% multi_plyr)) %>%
+  ungroup()
+
+# ---- 4.  Usage filters ----
+totals <- totals %>% filter(G >= 20, `3PA` >= 30)
+
+# ---- 5.  Select vars & add counts ----
+nba24 <- totals %>%
+  transmute(Player, Pos, Age, G,
+            `3P`, `3PA`, PTS, TRB, AST,
+            threes_made   = as.integer(`3P`),
+            threes_trials = as.integer(`3PA`))
+
+write_csv(nba24, "nba24_totals_clean.csv")
+cat("✔  Saved nba24_totals_clean.csv with", nrow(nba24), "rows\n")
+
+
+################################################################################
+## STAT-9270  •  NBA 2023-24 Bayesian Project
+## Analysis script: Beta-Binomial (3P%)  +  Student-t (PPG)
+## Reqs:  R ≥ 4.2  •  brms  •  tidyverse  •  posterior  •  loo
+## Author: George Aidinis   •   Seed set for exact replicability
+################################################################################
+
+## 0 ────────────────────────────────  Libraries  ───────────────────────────────
+libs <- c("tidyverse", "brms", "posterior", "bayesplot", "loo", "janitor")
+install_if_absent <- function(pkg)
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, repos="https://cloud.r-project.org")
+invisible(lapply(libs, install_if_absent))
+lapply(libs, library, character.only = TRUE)
+
+theme_set(theme_bw(base_size = 12))
+
+## 1 ────────────────────────────────  Data import  ─────────────────────────────
+f_csv <- "nba24_totals_clean.csv"              # produced by your Python step
+nba   <- read_csv(f_csv, show_col_types = FALSE) %>% clean_names()
+
+# Quick sanity check -----------------------------------------------------------
+stopifnot(nrow(nba) == 314L)
+glimpse(nba)
+
+# Derived variables ------------------------------------------------------------
+nba <- nba %>%
+  mutate(
+    pos      = factor(pos, levels = c("C","PF","SF","SG","PG")),
+    age_sc   = (age - mean(age, na.rm = TRUE)) / sd(age, na.rm = TRUE),
+    ppg      = pts / g                          # points per game
+  )
+
+## 2 ────────────────────────────────  Exploratory plots  ───────────────────────
+dir.create("figs",   showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+dir.create("models", showWarnings = FALSE)
+
+# 2.1 Histogram 3P% ------------------------------------------------------------
+fig_3p_hist <- ggplot(nba, aes(x = threes_made / threes_trials)) +
+  geom_histogram(bins = 30, color = "black") +
+  labs(x = "Raw 3-Point Percentage", y = "Count",
+       title = "Distribution of 3-Point Accuracy (min 30 3PA, 20 GP)")
+ggsave("figs/3p_hist.png", fig_3p_hist, width = 5, height = 4, dpi = 300)
+
+# 2.2 Histogram PPG ------------------------------------------------------------
+fig_ppg_hist <- ggplot(nba, aes(x = ppg)) +
+  geom_histogram(bins = 30, color = "black") +
+  labs(x = "Points per Game", y = "Count",
+       title = "Distribution of Points per Game")
+ggsave("figs/ppg_hist.png", fig_ppg_hist, width = 5, height = 4, dpi = 300)
+
+# 2.3 Table: sample sizes by position ------------------------------------------
+tbl_n_pos <- nba %>% count(pos, name = "N_players")
+write_csv(tbl_n_pos, "tables/n_by_position.csv")
+
+## 3 ───────────────────── Hierarchical Beta-Binomial  (3-Point %) ─────────────
+# brms can use the Beta-Binomial likelihood out-of-the-box
+set.seed(9270)
+form_bb  <- bf(threes_made | trials(threes_trials) ~ 1 + age_sc + (1 | pos))
+
+priors_bb <- c(
+  prior(normal(0, 2), class = "b",   coef = "age_sc"),
+  prior(normal(0, 5), class = "Intercept"),
+  prior(exponential(1), class = "sd")           # group-sd for positions
+)
+
+fit_bb <- brm(
+  formula  = form_bb,
+  data     = nba,
+  family   = binomial(link = "logit"),
+  prior    = priors_bb,
+  iter     = 4000, warmup = 1000,
+  chains   = 4, cores = parallel::detectCores(),
+  seed     = 9270,
+  control  = list(adapt_delta = 0.99,   # ← raise from 0.95
+                  max_treedepth = 12)   # ← small safety bump
+)
+
+fit_bb <- add_criterion(fit_bb, "loo")   # re-compute if you need LOO
+summary(fit_bb)$fixed                   # fixed-effect table
+bayesplot::mcmc_trace(as_draws_array(fit_bb))  # still looks good
+
+
+saveRDS(fit_bb, file = "models/fit_beta_binom.rds")
+
+# Posterior summary table ------------------------------------------------------
+summary_bb <- summary(fit_bb)$fixed %>% 
+  as_tibble(rownames = "parameter")
+
+# save to disk
+write_csv(summary_bb, "tables/bb_fixed_effects.csv")   # tidyverse version
+
+# Trace + density plot ---------------------------------------------------------
+mcmc_trace(as_draws_array(fit_bb),
+           pars = c("b_Intercept", "b_age_sc")) +
+  ggsave("figs/bb_trace.png", width = 6, height = 4, dpi = 300)
+
+# Posterior predictive check histogram ----------------------------------------
+
+# Pick a discrete palette that prints well (five ABA-inspired colours)
+chain_cols <- c("#0072B2", "#D55E00", "#009E73", "#CC79A7")
+
+# Build trace and density separately
+trace_bb <- mcmc_trace(
+  as_draws_array(fit_bb),
+  pars = c("b_Intercept", "b_age_sc"),
+  facet_args = list(ncol = 1),
+  n_warmup = 1000,             # shade first 1000 draws (warm-up)
+  size = 0.3
+) +
+  scale_color_manual(values = chain_cols, guide = "none") +
+  ggtitle("Trace plots (post-warm-up coloured)")
+
+dens_bb <- mcmc_dens_overlay(
+  as_draws_array(fit_bb),
+  pars = c("b_Intercept", "b_age_sc"),
+  facet_args = list(ncol = 1)
+) +
+  scale_fill_manual(values = chain_cols, guide = "none") +
+  scale_color_manual(values = chain_cols, guide = "none") +
+  ggtitle("Posterior densities")
+
+# Combine with patchwork (trace | density)
+diag_bb <- trace_bb | dens_bb
+
+# Tweak margins & save
+diag_bb <- diag_bb + plot_layout(widths = c(3, 2)) &
+  theme_bw(base_size = 11) &
+  theme(
+    plot.title  = element_text(size = 11, face = "bold", hjust = 0.5),
+    strip.text  = element_text(size = 9)
+  )
+
+ggsave("figs/bb_trace_density.png", diag_bb,
+       width = 7.5, height = 5.5, dpi = 300)
+
+## 4 ───────────── Student-t random-intercept-and-slope model (PPG) ─────────────
+set.seed(9271)
+form_ppg <- bf(ppg ~ 1 + age_sc + (1 + age_sc | pos))
+
+priors_ppg <- c(
+  prior(student_t(3, 0, 10), class = "Intercept"),
+  prior(student_t(3, 0, 2.5), class = "b"),
+  prior(exponential(1),       class = "sd"),       # sd for intercept & slope
+  prior(exponential(1),       class = "sigma"),
+  prior(gamma(2, 0.1),        class = "nu")        # df of Student-t
+)
+
+fit_ppg <- brm(
+  formula  = form_ppg,
+  data     = nba,
+  family   = student(),
+  prior    = priors_ppg,
+  iter     = 4000, warmup = 1000, chains = 4, cores = parallel::detectCores(),
+  seed     = 9271,
+  control  = list(adapt_delta = 0.95)
+)
+
+saveRDS(fit_ppg, file = "models/fit_ppg_student.rds")
+
+summary_ppg <- summary(fit_ppg)$fixed %>% as_tibble(rownames = "parameter")
+write_csv(summary_ppg, "tables/ppg_fixed_effects.csv")
+
+# Trace + density --------------------------------------------------------------
+chain_cols <- c("#0072B2", "#D55E00", "#009E73", "#CC79A7")   # same palette
+
+trace_ppg <- mcmc_trace(
+  as_draws_array(fit_ppg),
+  pars       = c("b_Intercept", "b_age_sc"),
+  facet_args = list(ncol = 1),
+  n_warmup   = 1000,
+  size       = 0.3
+) +
+  scale_color_manual(values = chain_cols, guide = "none") +
+  ggtitle("Trace plots (PPG model)")
+
+dens_ppg <- mcmc_dens_overlay(
+  as_draws_array(fit_ppg),
+  pars       = c("b_Intercept", "b_age_sc"),
+  facet_args = list(ncol = 1)
+) +
+  scale_fill_manual(values = chain_cols, guide = "none") +
+  scale_color_manual(values = chain_cols, guide = "none") +
+  ggtitle("Posterior densities (PPG model)")
+
+diag_ppg <- trace_ppg | dens_ppg +
+  plot_layout(widths = c(3, 2)) &
+  theme_bw(base_size = 11) &
+  theme(
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 9)
+  )
+
+ggsave("figs/ppg_trace_density.png", diag_ppg,
+       width = 7.5, height = 5.5, dpi = 300)
+
+## 5 ────────────────────────────────  Model comparison  ───────────────────────
+loo_bb  <- loo(fit_bb)
+loo_ppg <- loo(fit_ppg)               # note: different responses; no direct ΔLOO
+saveRDS(loo_bb,  "models/loo_bb.rds")
+saveRDS(loo_ppg,"models/loo_ppg.rds")
+
+## 6 ────────────────────────────────  Session info  ───────────────────────────
+writeLines(capture.output(sessionInfo()), "tables/session_info.txt")
+
+message("🎉  Finished!  Results are in figs/, tables/, and models/")
+
+
+## 7 ────────────────────────────────  Posterior draws  ────────────────────────
+library(posterior); library(dplyr); library(ggplot2)
+
+draws_bb  <- as_draws_df(fit_bb)
+draws_ppg <- as_draws_df(fit_ppg)
+
+# Helper: inverse-logit
+ilogit <- function(x) 1 / (1 + exp(-x))
+
+# 2.1  Position-level posterior 3-pt accuracy -------------------------------
+alpha_draws <- dplyr::select(draws_bb, starts_with("r_pos["))  # intercept offsets
+alpha_mat   <- as.matrix(alpha_draws) + draws_bb$b_Intercept
+alpha_pct   <- ilogit(alpha_mat)
+
+pos_levels <- levels(nba$pos)
+pos_summary <- tibble(
+  position = pos_levels,
+  mean_pct = colMeans(alpha_pct),
+  l95      = apply(alpha_pct, 2, quantile, 0.025),
+  u95      = apply(alpha_pct, 2, quantile, 0.975)
+)
+write_csv(pos_summary, "tables/pos_3p_summary.csv")
+
+# shrinkage plot -------------------------------------------------------------
+# (re)-add a percentage column -------------------------------------------------
+nba <- nba %>%
+  mutate(pct3 = threes_made / threes_trials)   # safe even if the columns exist
+
+# ---- shrinkage plot ----------------------------------------------------------
+shr_plot <- ggplot() +
+  # player-level jitter
+  geom_jitter(data = nba,
+              aes(x = pos, y = pct3),
+              width = .15, height = 0,
+              alpha = .45, size = 1) +
+  # position posterior means
+  geom_point(data = pos_summary,
+             aes(x = position, y = mean_pct),
+             colour = "red", size = 3) +
+  geom_errorbar(data = pos_summary,
+                aes(x = position, ymin = l95, ymax = u95),
+                width = .1, colour = "red") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(y = "3-Point percentage", x = "Position") +
+  theme_bw(base_size = 10)
+
+ggsave("figs/shrinkage_3p.png", shr_plot,
+       width = 5, height = 3.2, dpi = 300)
+
+# 2.2  Age slopes by position (Model 2) -------------------------------------
+beta_draws <- select(draws_ppg, starts_with("r_pos[") & ends_with(",age_sc]"))
+beta_mat   <- as.matrix(beta_draws) + draws_ppg$b_age_sc
+
+beta_summary <- tibble(
+  position = pos_levels,
+  mean     = colMeans(beta_mat),
+  l95      = apply(beta_mat, 2, quantile, .025),
+  u95      = apply(beta_mat, 2, quantile, .975)
+)
+write_csv(beta_summary, "tables/pos_age_slope.csv")
+
+cat_plot <- ggplot(beta_summary,
+                   aes(x = reorder(position, mean), y = mean))+
+  geom_point(size = 3)+
+  geom_errorbar(aes(ymin = l95, ymax = u95), width = .1)+
+  coord_flip()+
+  labs(x = "Position", y = "Age effect on PPG")+
+  theme_bw(base_size = 10)
+ggsave("figs/age_slope_pos.png", cat_plot, width = 5, height = 3, dpi = 300)
+
+# 2.3  Posterior predictive checks (overlay) --------------------------------
+library(bayesplot)
+pp_bb  <- pp_check(fit_bb, nsamples = 100) + ggtitle("Model 1 PPC")
+pp_ppg <- pp_check(fit_ppg, ndraws  = 100) + ggtitle("Model 2 PPC")
+
+ggsave("figs/ppc_bb.png", pp_bb , width = 3, height = 2.8, dpi = 300)
+ggsave("figs/ppc_ppg.png", pp_ppg, width = 3, height = 2.8, dpi = 300)
+
+# 2.4  Residual vs. fitted plot for PPG model --------------------------------
+resid_plot <- pp_check(fit_ppg, type = "scatter_avg") +
+  ggtitle("Residuals vs. fitted")
+ggsave("figs/ppg_resid.png", resid_plot, width = 3, height = 2.8, dpi = 300)
