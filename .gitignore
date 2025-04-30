@@ -1,0 +1,26 @@
+# Ignore LaTeX source files
+*.tex
+
+# LaTeX auxiliary files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Python cache (if any)
+__pycache__/
+*.py[cod]
+
+# Git submodule metadata
+.gitmodules
+
+# macOS finder files
+.DS_Store

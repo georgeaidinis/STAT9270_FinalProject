@@ -1,0 +1,3 @@
+parameter,Estimate,Est.Error,l95,u95,Rhat,ESS
+Intercept,-0.551,0.039,-0.629,-0.475,1.001,2806.043
+age_sc,0.045,0.008,0.031,0.06,1,6945.434
